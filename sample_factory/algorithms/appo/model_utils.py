@@ -421,6 +421,9 @@ class ActionParameterizationDefault(ActionsParameterizationBase):
     def forward(self, actor_core_output):
         """Just forward the FC layer and generate the distribution object."""
         action_distribution_params = self.distribution_linear(actor_core_output)
+        num_dims = int(action_distribution_params.shape[1]/2)
+        action_distribution_params[:num_dims] = torch.tanh(action_distribution_params[:num_dims])
+        # action_distribution_params[num_dims:] = torch.sigmoid(action_distribution_params[num_dims:])
         action_distribution = get_action_distribution(self.action_space, raw_logits=action_distribution_params)
         return action_distribution_params, action_distribution
 
@@ -447,6 +450,7 @@ class ActionParameterizationContinuousNonAdaptiveStddev(ActionsParameterizationB
 
     def forward(self, actor_core_output):
         action_means = self.distribution_linear(actor_core_output)
+        action_means = 1.2*torch.tanh(action_means)
 
         batch_size = action_means.shape[0]
         action_stddevs = self.learned_stddev.repeat(batch_size, 1)
