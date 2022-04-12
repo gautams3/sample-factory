@@ -1,4 +1,5 @@
-from typing import Tuple
+from abc import abstractmethod, ABC
+from typing import Tuple, Optional
 import glob
 import os
 import shutil
@@ -21,8 +22,9 @@ if os.name == 'nt':
 else:
     from faster_fifo import Queue as MpQueue
 
-from sample_factory.algorithms.appo.appo_utils import TaskType, list_of_dicts_to_dict_of_lists, memory_stats, cuda_envvars_for_policy, \
-    TensorBatcher, iter_dicts_recursively, copy_dict_structure, ObjectPool
+from sample_factory.algorithms.appo.appo_utils import TaskType, list_of_dicts_to_dict_of_lists, memory_stats, \
+    cuda_envvars_for_policy, \
+    TensorBatcher, iter_dicts_recursively, copy_dict_structure, ObjectPool, iterate_recursively
 from sample_factory.algorithms.appo.model import create_actor_critic
 from sample_factory.algorithms.appo.aux_losses import CPCA
 from sample_factory.algorithms.appo.population_based_training import PbtTask
@@ -181,6 +183,70 @@ def build_core_out_from_seq(x_seq: PackedSequence, inverted_select_inds):
     return x_seq.data.index_select(0, inverted_select_inds)
 
 
+class LearningRateScheduler:
+    def update(self, current_lr, recent_kls):
+        return current_lr
+
+    def invoke_after_each_minibatch(self):
+        return False
+
+    def invoke_after_each_epoch(self):
+        return False
+
+
+class KlAdaptiveScheduler(LearningRateScheduler, ABC):
+    def __init__(self, cfg):
+        self.lr_schedule_kl_threshold = cfg.lr_schedule_kl_threshold
+        self.min_lr = 1e-6
+        self.max_lr = 1e-2
+
+    @abstractmethod
+    def num_recent_kls_to_use(self) -> int:
+        pass
+
+    def update(self, current_lr, recent_kls):
+        num_kls_to_use = self.num_recent_kls_to_use()
+        kls = recent_kls[-num_kls_to_use:]
+        mean_kl = np.mean(kls)
+        lr = current_lr
+        if mean_kl > 2.0 * self.lr_schedule_kl_threshold:
+            lr = max(current_lr / 1.5, self.min_lr)
+        if mean_kl < (0.5 * self.lr_schedule_kl_threshold):
+            lr = min(current_lr * 1.5, self.max_lr)
+        return lr
+
+
+class KlAdaptiveSchedulerPerMinibatch(KlAdaptiveScheduler):
+    def num_recent_kls_to_use(self) -> int:
+        return 1
+
+    def invoke_after_each_minibatch(self):
+        return True
+
+
+class KlAdaptiveSchedulerPerEpoch(KlAdaptiveScheduler):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.num_minibatches_per_epoch = cfg.num_batches_per_iteration
+
+    def num_recent_kls_to_use(self) -> int:
+        return self.num_minibatches_per_epoch
+
+    def invoke_after_each_epoch(self):
+        return True
+
+
+def get_lr_scheduler(cfg) -> LearningRateScheduler:
+    if cfg.lr_schedule == 'constant':
+        return LearningRateScheduler()
+    elif cfg.lr_schedule == 'kl_adaptive_minibatch':
+        return KlAdaptiveSchedulerPerMinibatch(cfg)
+    elif cfg.lr_schedule == 'kl_adaptive_epoch':
+        return KlAdaptiveSchedulerPerEpoch(cfg)
+    else:
+        raise RuntimeError(f'Unknown scheduler {cfg.lr_schedule}')
+
+
 class LearnerWorker:
     def __init__(
         self, worker_idx, policy_id, cfg, obs_space, action_space, report_queue, policy_worker_queues, shared_buffers,
@@ -220,6 +286,8 @@ class LearnerWorker:
         self.optimizer = None
         self.policy_lock = policy_lock
         self.resume_experience_collection_cv = resume_experience_collection_cv
+
+        self.lr_scheduler: Optional[LearningRateScheduler] = None
 
         self.task_queue = MpQueue()
         self.report_queue = report_queue
@@ -330,14 +398,9 @@ class LearnerWorker:
         This is leftover the from previous version of the algorithm.
         Perhaps should be re-implemented in PyTorch tensors, similar to V-trace for uniformity.
         """
-        ent_coeff = self.cfg.ppo_max_entropy_coeff
-        # rewards = np.stack(buffer.rewards + ent_coeff * buffer.log_prob_actions).squeeze()  # [E, T]
-        entropies = get_action_distribution(self.action_space, torch.Tensor(np.stack(buffer.action_logits))).entropy().numpy()
-        buffer.weighted_entropies = ent_coeff * entropies # TODO: use this for logging in the future
-        rewards = np.stack(buffer.rewards + ent_coeff * entropies).squeeze()  # [E, T]
-
-        dones = np.stack(buffer.dones).squeeze()  # [E, T]
-        values_arr = np.stack(buffer.values).squeeze()  # [E, T]
+        rewards = np.copy(buffer.rewards)  # [E, T]
+        dones = np.copy(buffer.dones)  # [E, T]
+        values_arr = np.copy(buffer.values)  # [E, T]
 
         # calculating fake values for the last step in the rollout
         # this will make sure that advantage of the very last action is always zero
@@ -358,11 +421,6 @@ class LearnerWorker:
         # transpose tensors back to [E, T] before creating a single experience buffer
         buffer.advantages = advantages.transpose((1, 0))  # [T, E] -> [E, T]
         buffer.returns = returns.transpose((1, 0))  # [T, E] -> [E, T]
-        buffer.returns = buffer.returns[:, :, np.newaxis]  # [E, T] -> [E, T, 1]
-
-        buffer.advantages = [torch.tensor(buffer.advantages).reshape(-1)]
-        buffer.returns = [torch.tensor(buffer.returns).reshape(-1)]
-
         return buffer
 
     def _prepare_train_buffer(self, rollouts, macro_batch_size, timing):
@@ -383,11 +441,35 @@ class LearnerWorker:
                 if isinstance(x[0], (dict, OrderedDict)):
                     buffer[key] = list_of_dicts_to_dict_of_lists(x)
 
+        with timing.add_time('buffer_stack_and_squeeze'):
+            tensors_to_squeeze = [
+                'actions', 'log_prob_actions', 'policy_version', 'policy_id', 'values', 'rewards', 'dones',
+            ]
+
+            for d, key, arr in iterate_recursively(buffer):
+                t = np.stack(arr)  # all buffers should now be [E, T, orig_shape]
+                if key in tensors_to_squeeze:
+                    t = t.squeeze()
+                d[key] = t
+
+        # add max entropy to the rewards
+        if self.cfg.max_entropy_coeff != 0.0:
+            with timing.add_time('max_entropy'), torch.no_grad():
+                action_distr_params = buffer.action_logits.reshape((-1, buffer.action_logits.shape[-1]))  # [E*T, A]
+                entropies = get_action_distribution(self.action_space, torch.Tensor(action_distr_params)).entropy().numpy()  # [E*T]
+                entropies = entropies.reshape((-1, self.cfg.rollout))  # [E, T]
+                buffer.rewards += self.cfg.max_entropy_coeff * entropies  # [E, T]
+
         if not self.cfg.with_vtrace:
             with timing.add_time('calc_gae'):
                 buffer = self._calculate_gae(buffer)
 
         with timing.add_time('batching'):
+            for d, key, arr in iterate_recursively(buffer):
+                envs_dim, time_dim = arr.shape[0:2]
+                new_shape = (envs_dim * time_dim, ) + arr.shape[2:]
+                d[key] = arr.reshape(new_shape)
+
             # concatenate rollouts from different workers into a single batch efficiently
             # that is, if we already have memory for the buffers allocated, we can just copy the data into
             # existing cached tensors instead of creating new ones. This is a performance optimization.
@@ -399,15 +481,6 @@ class LearnerWorker:
 
         with timing.add_time('tensors_gpu_float'):
             device_buffer = self._copy_train_data_to_device(buffer)
-
-        with timing.add_time('squeeze'):
-            # will squeeze actions only in simple categorical case
-            tensors_to_squeeze = [
-                'actions', 'log_prob_actions', 'policy_version', 'policy_id', 'values',
-                'rewards', 'dones', 'rewards_cpu', 'dones_cpu',
-            ]
-            for tensor_name in tensors_to_squeeze:
-                device_buffer[tensor_name].squeeze_()
 
         # we no longer need the cached buffer, and can put it back into the pool
         self.tensor_batch_pool.put(buffer)
@@ -651,6 +724,15 @@ class LearnerWorker:
         kl_prior_loss = self.cfg.exploration_loss_coeff * kl_prior
         return kl_prior_loss
 
+    def _curr_lr(self):
+        for param_group in self.optimizer.param_groups:
+            return param_group['lr']
+
+    def _update_lr(self, new_lr):
+        if new_lr != self._curr_lr():
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = new_lr
+
     def _prepare_observations(self, obs_tensors, gpu_buffer_obs):
         for d, gpu_d, k, v, _ in iter_dicts_recursively(obs_tensors, gpu_buffer_obs):
             device, dtype = self.actor_critic.device_and_type_for_input_tensor(k)
@@ -680,6 +762,9 @@ class LearnerWorker:
             early_stop = False
             prev_epoch_actor_loss = 1e9
             epoch_actor_losses = []
+
+            # recent mean KL-divergences per minibatch, this used by LR schedulers
+            recent_kls = []
 
             # V-trace parameters
             # noinspection PyArgumentList
@@ -846,6 +931,16 @@ class LearnerWorker:
                         )
                         force_summaries = True
 
+                with timing.add_time('kl_divergence'):
+                    # calculate KL-divergence with the behaviour policy action distribution
+                    old_action_distribution = get_action_distribution(
+                        self.actor_critic.action_space, mb.action_logits,
+                    )
+
+                    kl_old = action_distribution.kl_divergence(old_action_distribution)
+                    kl_old_mean = kl_old.mean().item()
+                    recent_kls.append(kl_old_mean)
+
                 # update the weights
                 with timing.add_time('update'):
                     # following advice from https://youtu.be/9mS1fIYj1So set grad to None instead of optimizer.zero_grad()
@@ -873,6 +968,9 @@ class LearnerWorker:
                     with timing.add_time('after_optimizer'):
                         self._after_optimizer_step()
 
+                        if self.lr_scheduler.invoke_after_each_minibatch():
+                            self._update_lr(self.lr_scheduler.update(self._curr_lr(), recent_kls))
+
                         # collect and report summaries
                         with_summaries = self._should_save_summaries() or force_summaries
                         if with_summaries and not summary_this_epoch:
@@ -881,6 +979,9 @@ class LearnerWorker:
                             force_summaries = False
 
             # end of an epoch
+            if self.lr_scheduler.invoke_after_each_epoch():
+                self._update_lr(self.lr_scheduler.update(self._curr_lr(), recent_kls))
+
             # this will force policy update on the inference worker (policy worker)
             self.policy_versions[self.policy_id] = self.train_step
 
@@ -904,6 +1005,8 @@ class LearnerWorker:
 
         self.last_summary_time = time.time()
         stats = AttrDict()
+
+        stats.lr = self._curr_lr()
 
         stats.valids_fraction = var.valids.float().mean()
         stats.same_policy_fraction = (var.mb.policy_id == self.policy_id).float().mean()
@@ -941,16 +1044,8 @@ class LearnerWorker:
             value_delta = torch.abs(var.values - var.old_values)
             value_delta_avg, value_delta_max = value_delta.mean(), value_delta.max()
 
-            # calculate KL-divergence with the behaviour policy action distribution
-            old_action_distribution = get_action_distribution(
-                self.actor_critic.action_space, var.mb.action_logits,
-            )
-            kl_old = var.action_distribution.kl_divergence(old_action_distribution)
-            kl_old_mean = kl_old.mean()
-            kl_old_max = kl_old.max()
-
-            stats.kl_divergence = kl_old_mean
-            stats.kl_divergence_max = kl_old_max
+            stats.kl_divergence = var.kl_old_mean
+            stats.kl_divergence_max = var.kl_old.max()
             stats.value_delta = value_delta_avg
             stats.value_delta_max = value_delta_max
             stats.fraction_clipped = ((var.ratio < var.clip_ratio_low).float() + (var.ratio > var.clip_ratio_high).float()).mean()
@@ -1084,6 +1179,8 @@ class LearnerWorker:
                 betas=(self.cfg.adam_beta1, self.cfg.adam_beta2),
                 eps=self.cfg.adam_eps,
             )
+
+            self.lr_scheduler = get_lr_scheduler(self.cfg)
 
             self.load_from_checkpoint(self.policy_id)
 

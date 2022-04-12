@@ -24,7 +24,7 @@ VizDoom agents trained with Sample Factory playing in real time:
 
 #### When should I use Sample Factory?
 
-1. Sample Factory is the fastest open source single-machine RL implementations (see paper for details).
+1. Sample Factory is one of the fastest open source single-machine RL implementations (see paper for details).
 If you plan to train RL agents on large amounts of experience, consider using it.
 Sample Factory can significantly speed up
 the experimentation or allow you to collect more samples in the same amount of time and achieve better performance.
@@ -40,6 +40,16 @@ Consider using Sample Factory if you train agents in these environments.
 codebase for other types of async RL algorithms.
 
 ## Recent releases
+
+##### v1.123.0
+
+* Added max entropy objective (disabled by default). To turn it on, use `--max_entropy_coeff`. Adds action distribution
+entropies to rewards (similar to SAC) thus encouraging exploration. See [this paper](https://arxiv.org/abs/1805.00909).
+
+##### v1.122.0
+
+* Added adaptive learning rate scheduler
+* Added default PyTorch model tensor initialization 
 
 ##### v1.121.4
 * Support Weights and Biases (see section "WandB support")
@@ -137,6 +147,8 @@ Command lines for running experiments with these datasets are provided in the se
  
 ALE envs are supported out-of-the-box, although the existing wrappers and hyperparameters
 aren't well optimized for sample efficiency in Atari. Tuned Atari training examples would be a welcome contribution.
+
+Since ~2022 some extra steps might be required to install atari: `pip install "gym[atari,accept-rom-license]"`
  
 #### Custom multi-agent environments
 
